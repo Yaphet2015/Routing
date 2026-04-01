@@ -1,4 +1,7 @@
+import { execFile } from "node:child_process";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { z } from "zod";
 
@@ -8,11 +11,14 @@ import type { ApprovalRequest, RuntimeEvent } from "../domain/protocol";
 import type {
   AgentRuntimePort,
   BrokerPort,
+  WorktreeManagerPort,
+  WorkerRuntimePort,
   RuntimeEnginePort,
   RuntimeStartInput
 } from "../domain/ports";
 import type {
   ArtifactRef,
+  CollaborationTask,
   PlanStep,
   RunState,
   TaskGraph,
@@ -20,7 +26,7 @@ import type {
   UserInteractionResponse,
   VerifyObservation
 } from "../domain/types";
-import { debitBudget } from "./budget";
+import { reserveBudget, debitBudget } from "./budget";
 import {
   beginRunExecution,
   createEmptyStepState,
@@ -35,6 +41,10 @@ import {
   updateTaskRegistryStep
 } from "./task-registry";
 import { judgeVerification } from "./verification";
+import { LocalProcessWorkerRuntime } from "../workers/local-process-worker-runtime";
+import { GitWorktreeManager } from "../workers/worktree-manager";
+
+const execFileAsync = promisify(execFile);
 
 const planStepSchema = z.object({
   id: z.string(),
@@ -162,6 +172,8 @@ interface RuntimeEngineOptions {
   broker: BrokerPort;
   agentRuntime: AgentRuntimePort;
   requirePlanApproval: boolean;
+  workerRuntime?: WorkerRuntimePort;
+  worktreeManager?: WorktreeManagerPort;
 }
 
 export class DeterministicRuntimeEngine implements RuntimeEnginePort {
@@ -321,21 +333,33 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         title: step.title
       } satisfies RuntimeEventDraft);
 
-      const execution = await this.options.agentRuntime.invoke<{
+      let execution: {
         summary: string;
         artifact_refs: ArtifactRef[];
-      }>({
-        role: "executor",
-        prompt: `${step.title}\n${step.action}`,
-        schema: executionSchema,
-        sessionId: currentRun.run_id
-      });
-      currentRun = await this.applyBudgetDebit(
-        currentRun,
-        execution.totalCostUsd,
-        `executing ${step.id}`
-      );
-      registry = recordTaskRegistryArtifacts(registry, execution.output.artifact_refs);
+      };
+      if (step.execution_mode === "delegated") {
+        const delegated = await this.executeDelegatedStep(currentRun, step);
+        currentRun = delegated.run;
+        execution = delegated.execution;
+      } else {
+        const inlineExecution = await this.options.agentRuntime.invoke<{
+          summary: string;
+          artifact_refs: ArtifactRef[];
+        }>({
+          role: "executor",
+          prompt: `${step.title}\n${step.action}`,
+          schema: executionSchema,
+          sessionId: currentRun.run_id
+        });
+        currentRun = await this.applyBudgetDebit(
+          currentRun,
+          inlineExecution.totalCostUsd,
+          `executing ${step.id}`
+        );
+        execution = inlineExecution.output;
+      }
+
+      registry = recordTaskRegistryArtifacts(registry, execution.artifact_refs);
       await this.saveTaskRegistry(currentRun, registry);
       if (currentRun.run_status === "AwaitingUser" || currentRun.run_status === "Failed") {
         await this.saveRunState(currentRun);
@@ -345,7 +369,7 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       await this.publishRuntimeEvent(currentRun, {
         type: "step_execution_finished",
         step_id: step.id,
-        summary: execution.output.summary
+        summary: execution.summary
       } satisfies RuntimeEventDraft);
 
       const verification = await this.options.agentRuntime.invoke<VerifyObservation>({
@@ -379,7 +403,7 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       } satisfies RuntimeEventDraft);
 
       if (decision.status === "pass") {
-        const artifactIds = execution.output.artifact_refs.map((artifact) => artifact.id);
+        const artifactIds = execution.artifact_refs.map((artifact) => artifact.id);
         stepStates[step.id] = markStepPassed(stepStates[step.id], artifactIds);
         registry = updateTaskRegistryStep(registry, step.id, stepStates[step.id]);
         await this.saveTaskRegistry(currentRun, registry);
@@ -424,6 +448,202 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         return currentRun;
       }
     }
+  }
+
+  private async executeDelegatedStep(
+    run: RunState,
+    step: PlanStep
+  ): Promise<{
+    run: RunState;
+    execution: {
+      summary: string;
+      artifact_refs: ArtifactRef[];
+    };
+  }> {
+    const taskId = `${run.run_id}-${step.id}-delegated`;
+    const agentId = `worker-${step.id}`;
+    const task: CollaborationTask = {
+      id: taskId,
+      run_id: run.run_id,
+      source_step_ids: [step.id],
+      title: step.title,
+      objective: step.action,
+      required_profile: step.preferred_profile,
+      owner_policy: "assignable",
+      assigned_agent_id: agentId,
+      runtime_placement: "local_process",
+      isolation_mode: "worktree",
+      dependencies: [...step.dependencies],
+      input_artifacts: [],
+      acceptance_ref: {
+        verification_spec_ids: [step.verification_spec_id],
+        done_when: step.done_when
+      },
+      status: "Pending",
+      timeout_ms: step.timeout_ms
+    };
+
+    const worktreeManager =
+      this.options.worktreeManager ?? new GitWorktreeManager(this.options.workspaceDir);
+    const workerRuntime =
+      this.options.workerRuntime ?? new LocalProcessWorkerRuntime();
+    const worktree = await worktreeManager.create(run.run_id, taskId);
+    const reserved = reserveBudget(run.budget_snapshot, run.budget_snapshot.policy.teammate_budget_cap_usd, {
+      entry_id: `${run.run_id}-${run.budget_snapshot.ledger.length + 1}`,
+      session_id: run.session_id,
+      run_id: run.run_id,
+      step_id: step.id,
+      collab_task_id: taskId,
+      kind: "reservation",
+      amount_usd: run.budget_snapshot.policy.teammate_budget_cap_usd,
+      created_at: new Date().toISOString()
+    });
+    let nextRun: RunState = {
+      ...run,
+      active_task_ids: [...run.active_task_ids, taskId],
+      budget_snapshot: reserved.snapshot
+    };
+
+    await this.publishRuntimeEvent(nextRun, {
+      type: "collab_task_created",
+      task_id: taskId
+    } satisfies RuntimeEventDraft);
+
+    const assignmentMessage = {
+      type: "task_assignment" as const,
+      message_id: `${taskId}-assignment`,
+      seq: 0,
+      session_id: run.session_id,
+      run_id: run.run_id,
+      from_agent_id: "leader",
+      to_agent_id: agentId,
+      created_at: new Date().toISOString(),
+      task
+    };
+    await this.options.broker.publish(assignmentMessage);
+    await this.options.broker.deliver(assignmentMessage.message_id);
+    await this.options.broker.publish({
+      type: "status_update",
+      message_id: `${taskId}-running`,
+      seq: 0,
+      session_id: run.session_id,
+      run_id: run.run_id,
+      from_agent_id: agentId,
+      to_agent_id: "leader",
+      created_at: new Date().toISOString(),
+      status: "Running",
+      detail: step.title
+    });
+
+    const result = await workerRuntime.run({
+      command: process.execPath,
+      args: [
+        join(this.options.rootDir, "src", "worker-entry.ts"),
+        this.options.rootDir,
+        worktree.path,
+        run.session_id,
+        run.run_id,
+        agentId
+      ],
+      cwd: this.options.rootDir,
+      env: process.env
+    });
+
+    if (result.exitCode !== 0) {
+      await worktreeManager.remove(worktree.path).catch(() => undefined);
+      nextRun = {
+        ...nextRun,
+        run_status: "Failed"
+      };
+      await this.publishRuntimeEvent(nextRun, {
+        type: "run_failed",
+        reason: `Delegated worker failed for ${step.id}`
+      } satisfies RuntimeEventDraft);
+      return {
+        run: nextRun,
+        execution: {
+          summary: `Delegated worker failed for ${step.id}`,
+          artifact_refs: []
+        }
+      };
+    }
+
+    const patch = await this.captureWorktreePatch(worktree.path);
+    const artifactRefs: ArtifactRef[] = [];
+    if (patch.trim()) {
+      const patchPath = join(
+        this.options.rootDir,
+        ".harness",
+        "sessions",
+        run.session_id,
+        "runs",
+        run.run_id,
+        "artifacts",
+        `${taskId}.patch`
+      );
+      await writeFile(patchPath, patch, "utf8");
+      await execFileAsync("git", ["apply", patchPath], {
+        cwd: this.options.workspaceDir
+      });
+      const patchArtifact: ArtifactRef = {
+        id: `${taskId}-patch`,
+        kind: "patch",
+        producer_agent_id: agentId,
+        produced_at: new Date().toISOString(),
+        path: patchPath,
+        worktree_ref: worktree.path,
+        base_commit: worktree.baseCommit,
+        source_step_ids: [step.id],
+        summary: `Patch generated for ${step.id}`
+      };
+      artifactRefs.push(patchArtifact);
+      await this.options.broker.publish({
+        type: "artifact_published",
+        message_id: `${patchArtifact.id}-published`,
+        seq: 0,
+        session_id: run.session_id,
+        run_id: run.run_id,
+        from_agent_id: agentId,
+        to_agent_id: "leader",
+        created_at: new Date().toISOString(),
+        artifact: patchArtifact
+      });
+    }
+
+    await this.options.broker.publish({
+      type: "task_result",
+      message_id: `${taskId}-result`,
+      seq: 0,
+      session_id: run.session_id,
+      run_id: run.run_id,
+      from_agent_id: agentId,
+      to_agent_id: "leader",
+      created_at: new Date().toISOString(),
+      task_id: taskId,
+      artifact_refs: artifactRefs,
+      summary: `Delegated task ${taskId} completed`
+    });
+    await this.options.broker.publish({
+      type: "status_update",
+      message_id: `${taskId}-completed`,
+      seq: 0,
+      session_id: run.session_id,
+      run_id: run.run_id,
+      from_agent_id: agentId,
+      to_agent_id: "leader",
+      created_at: new Date().toISOString(),
+      status: "Completed",
+      detail: step.title
+    });
+
+    await worktreeManager.remove(worktree.path).catch(() => undefined);
+    return {
+      run: nextRun,
+      execution: {
+        summary: `Delegated task ${taskId} completed`,
+        artifact_refs: artifactRefs
+      }
+    };
   }
 
   private async applyBudgetDebit(
@@ -548,5 +768,13 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       ),
       registry
     );
+  }
+
+  private async captureWorktreePatch(worktreePath: string): Promise<string> {
+    const { stdout } = await execFileAsync("git", ["diff", "--binary"], {
+      cwd: worktreePath,
+      maxBuffer: 10 * 1024 * 1024
+    });
+    return stdout;
   }
 }

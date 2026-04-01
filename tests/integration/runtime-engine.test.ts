@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 import { FileSystemBroker } from "../../src/adapters/fs/file-system-broker";
+import type { WorkerRuntimePort, LocalProcessRunInput, LocalProcessRunResult } from "../../src/domain/ports";
 import { DeterministicRuntimeEngine } from "../../src/runtime/runtime-engine";
 import type {
   AgentRuntimeInvocation,
@@ -11,6 +14,9 @@ import type {
   AgentRuntimePort
 } from "../../src/domain/ports";
 import type { TaskGraph, VerifyObservation } from "../../src/domain/types";
+import { GitWorktreeManager } from "../../src/workers/worktree-manager";
+
+const execFileAsync = promisify(execFile);
 
 class FakeAgentRuntime implements AgentRuntimePort {
   async invoke<TOutput>(
@@ -294,6 +300,97 @@ class BudgetGateAgentRuntime implements AgentRuntimePort {
   }
 }
 
+class DelegatedWorkerAgentRuntime implements AgentRuntimePort {
+  async invoke<TOutput>(
+    invocation: AgentRuntimeInvocation<TOutput>
+  ): Promise<AgentRuntimeInvocationResult<TOutput>> {
+    if (invocation.role === "planner") {
+      return {
+        sessionId: "planner-session",
+        totalCostUsd: 0.11,
+        output: {
+          goal: "Ship delegated work",
+          assumptions: [],
+          steps: [
+            {
+              id: "step-1",
+              title: "Delegate feature",
+              type: "implement",
+              action: "Delegate the code change",
+              dependencies: [],
+              preferred_profile: "executor",
+              execution_mode: "delegated",
+              verification_spec_id: "verify-1",
+              done_when: {},
+              max_retries: 1,
+              timeout_ms: 60_000
+            }
+          ],
+          verification_specs: [
+            {
+              id: "verify-1",
+              related_step_ids: ["step-1"],
+              description: "File updated",
+              invariants: [],
+              test_scenarios: [
+                {
+                  name: "file updated",
+                  given: "delegated task completed",
+                  when: "verification runs",
+                  then: "feature file contains delegated change",
+                  priority: "must"
+                }
+              ],
+              verification_approach: "Read the file",
+              acceptance_criteria: ["feature file contains delegated change"]
+            }
+          ],
+          budget_policy: {
+            task_budget_usd: 10,
+            step_budget_cap_usd: 5,
+            replan_budget_cap_usd: 2,
+            teammate_budget_cap_usd: 2,
+            approval_threshold_usd: 8,
+            hard_stop_threshold_usd: 10
+          }
+        } as TOutput,
+        messages: []
+      };
+    }
+
+    const observation: VerifyObservation = {
+      verification_spec_id: "verify-1",
+      commands_run: [],
+      scenario_results: [
+        {
+          scenario: "file updated",
+          priority: "must",
+          status: "passed"
+        }
+      ],
+      generated_artifacts: [],
+      summary: "verification passed"
+    };
+
+    return {
+      sessionId: "verifier-session",
+      totalCostUsd: 0.09,
+      output: observation as TOutput,
+      messages: []
+    };
+  }
+}
+
+class FakeDelegatedWorkerRuntime implements WorkerRuntimePort {
+  async run(input: LocalProcessRunInput): Promise<LocalProcessRunResult> {
+    await writeFile(join(input.cwd, "feature.txt"), "delegated change\n", "utf8");
+    return {
+      exitCode: 0,
+      signal: null
+    };
+  }
+}
+
 describe("DeterministicRuntimeEngine", () => {
   const roots: string[] = [];
 
@@ -399,5 +496,58 @@ describe("DeterministicRuntimeEngine", () => {
 
     expect(run.run_status).toBe("AwaitingUser");
     expect(run.pending_user_request?.kind).toBe("budget_gate");
+  });
+
+  it("materializes delegated work, applies the resulting patch, and completes the run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "routing-runtime-delegated-"));
+    roots.push(root);
+
+    await execFileAsync("git", ["init"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "routing@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Routing Tests"], { cwd: root });
+    await writeFile(join(root, "feature.txt"), "base line\n", "utf8");
+    await execFileAsync("git", ["add", "feature.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-m", "init"], { cwd: root });
+
+    const broker = new FileSystemBroker(root, "session-1", "run-1");
+    const engine = new DeterministicRuntimeEngine({
+      rootDir: root,
+      workspaceDir: root,
+      broker,
+      agentRuntime: new DelegatedWorkerAgentRuntime(),
+      requirePlanApproval: false,
+      workerRuntime: new FakeDelegatedWorkerRuntime(),
+      worktreeManager: new GitWorktreeManager(root)
+    });
+
+    const run = await engine.startRun({
+      sessionId: "session-1",
+      runId: "run-1",
+      goal: "delegate the file change"
+    });
+
+    expect(run.run_status).toBe("Completed");
+    expect(run.budget_snapshot.reserved_usd).toBeGreaterThan(0);
+
+    await expect(readFile(join(root, "feature.txt"), "utf8")).resolves.toContain(
+      "delegated change"
+    );
+
+    const eventLog = await readFile(
+      join(
+        root,
+        ".harness",
+        "sessions",
+        "session-1",
+        "runs",
+        "run-1",
+        "events",
+        "events.ndjson"
+      ),
+      "utf8"
+    );
+
+    expect(eventLog).toContain("\"type\":\"task_assignment\"");
+    expect(eventLog).toContain("\"type\":\"task_result\"");
   });
 });

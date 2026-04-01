@@ -9,6 +9,7 @@
 - Made session resume reject incompatible event-log protocol versions before restoring the active run.
 - Added runtime retries, budget-gate user stops, and persisted task-registry projection updates for step/artifact state.
 - Added local worker foundations: git worktree isolation, local process launching, broker-driven worker host execution, and a standalone worker entrypoint.
+- Wired delegated runtime steps through isolated worktrees with patch artifact capture and leader-side patch apply back into the main workspace.
 
 ## 0.1.0
 

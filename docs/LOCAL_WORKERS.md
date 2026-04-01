@@ -15,6 +15,6 @@ Phase 2 introduces a local-process teammate foundation without enabling delegate
 
 ## Current limits
 
-- Worker execution exists, but the leader runtime does not yet materialize delegated steps into worker tasks.
-- Worktree lifecycle is available, but the main runtime does not yet apply worker artifacts back into the leader workspace.
+- The leader runtime now materializes delegated steps into worker tasks, runs them inside isolated worktrees, captures a patch artifact, and applies that patch back into the leader workspace.
 - Approval escalation from teammate to leader/user is not wired yet.
+- Ownership rebuild, orphan worker recovery, and teammate-driven approval escalation are still pending.
