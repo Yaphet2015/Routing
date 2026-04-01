@@ -8,6 +8,7 @@
 - Added a testable REPL host shell with `/status`, `/runs`, `/attach`, `/pause`, `/resume`, and `/approve` commands backed by session-kernel lifecycle methods.
 - Made session resume reject incompatible event-log protocol versions before restoring the active run.
 - Added runtime retries, budget-gate user stops, and persisted task-registry projection updates for step/artifact state.
+- Added local worker foundations: git worktree isolation, local process launching, broker-driven worker host execution, and a standalone worker entrypoint.
 
 ## 0.1.0
 

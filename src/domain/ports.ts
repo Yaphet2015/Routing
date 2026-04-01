@@ -79,6 +79,32 @@ export interface MetricsSink {
   flush(): Promise<void>;
 }
 
+export interface WorktreeLease {
+  path: string;
+  baseCommit: string;
+}
+
+export interface WorktreeManagerPort {
+  create(runId: string, taskId: string): Promise<WorktreeLease>;
+  remove(path: string): Promise<void>;
+}
+
+export interface LocalProcessRunInput {
+  command: string;
+  args?: string[];
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface LocalProcessRunResult {
+  exitCode: number;
+  signal: NodeJS.Signals | null;
+}
+
+export interface WorkerRuntimePort {
+  run(input: LocalProcessRunInput): Promise<LocalProcessRunResult>;
+}
+
 export interface UserInteractionPort {
   request(input: UserInteractionRequest): Promise<UserInteractionResponse>;
 }
