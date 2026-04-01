@@ -1,6 +1,9 @@
+import { join } from "node:path";
+
 import { z } from "zod";
 
 import { FileSystemRunStateStore } from "../adapters/fs/state-store";
+import { writeJsonAtomic } from "../adapters/fs/file-utils";
 import type { ApprovalRequest, RuntimeEvent } from "../domain/protocol";
 import type {
   AgentRuntimePort,
@@ -9,6 +12,7 @@ import type {
   RuntimeStartInput
 } from "../domain/ports";
 import type {
+  ArtifactRef,
   PlanStep,
   RunState,
   TaskGraph,
@@ -25,6 +29,11 @@ import {
   markStepPassed,
   selectNextExecutableStep
 } from "./state-machine";
+import {
+  createTaskRegistrySnapshot,
+  recordTaskRegistryArtifacts,
+  updateTaskRegistryStep
+} from "./task-registry";
 import { judgeVerification } from "./verification";
 
 const planStepSchema = z.object({
@@ -86,11 +95,6 @@ const taskGraphSchema = z.object({
   })
 });
 
-const executionSchema = z.object({
-  summary: z.string(),
-  artifact_refs: z.array(z.object({}).passthrough()).default([])
-});
-
 const artifactSchema = z.object({
   id: z.string(),
   kind: z.enum([
@@ -119,6 +123,11 @@ const artifactSchema = z.object({
     })
     .optional(),
   summary: z.string()
+});
+
+const executionSchema = z.object({
+  summary: z.string(),
+  artifact_refs: z.array(artifactSchema).default([])
 });
 
 const verificationSchema = z.object({
@@ -263,11 +272,27 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       Object.fromEntries(
         graph.steps.map((step: PlanStep) => [step.id, createEmptyStepState(step.id)])
       );
+    let registry = createTaskRegistrySnapshot(run.run_id, run.plan_version, graph);
+    await this.saveTaskRegistry(run, registry);
     let currentRun = run;
 
     while (true) {
       const step = selectNextExecutableStep(graph.steps, stepStates);
       if (!step) {
+        if (Object.values(stepStates).some((state) => state.status === "Failed")) {
+          currentRun = {
+            ...currentRun,
+            run_status: "Failed"
+          };
+          await this.publishRuntimeEvent(currentRun, {
+            type: "run_failed",
+            reason: "No executable step remains"
+          } satisfies RuntimeEventDraft);
+          await this.saveRunState(currentRun);
+          await this.saveTaskRegistry(currentRun, registry);
+          return currentRun;
+        }
+
         currentRun = {
           ...currentRun,
           run_status: "Completed",
@@ -279,10 +304,17 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
           summary: graph.goal
         } satisfies RuntimeEventDraft);
         await this.saveRunState(currentRun);
+        await this.saveTaskRegistry(currentRun, registry);
         return currentRun;
       }
 
       currentRun = beginRunExecution(currentRun, step.id);
+      registry = updateTaskRegistryStep(registry, step.id, {
+        ...stepStates[step.id],
+        status: "Executing",
+        attempt: currentRun.current_step_attempt ?? 1
+      });
+      await this.saveTaskRegistry(currentRun, registry);
       await this.publishRuntimeEvent(currentRun, {
         type: "step_started",
         step_id: step.id,
@@ -291,14 +323,24 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
 
       const execution = await this.options.agentRuntime.invoke<{
         summary: string;
-        artifact_refs: unknown[];
+        artifact_refs: ArtifactRef[];
       }>({
         role: "executor",
         prompt: `${step.title}\n${step.action}`,
         schema: executionSchema,
         sessionId: currentRun.run_id
       });
-      currentRun = await this.applyBudgetDebit(currentRun, execution.totalCostUsd);
+      currentRun = await this.applyBudgetDebit(
+        currentRun,
+        execution.totalCostUsd,
+        `executing ${step.id}`
+      );
+      registry = recordTaskRegistryArtifacts(registry, execution.output.artifact_refs);
+      await this.saveTaskRegistry(currentRun, registry);
+      if (currentRun.run_status === "AwaitingUser" || currentRun.run_status === "Failed") {
+        await this.saveRunState(currentRun);
+        return currentRun;
+      }
 
       await this.publishRuntimeEvent(currentRun, {
         type: "step_execution_finished",
@@ -312,7 +354,16 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         schema: verificationSchema,
         sessionId: currentRun.run_id
       });
-      currentRun = await this.applyBudgetDebit(currentRun, verification.totalCostUsd);
+      currentRun = await this.applyBudgetDebit(
+        currentRun,
+        verification.totalCostUsd,
+        `verifying ${step.id}`
+      );
+      if (currentRun.run_status === "AwaitingUser" || currentRun.run_status === "Failed") {
+        await this.saveRunState(currentRun);
+        await this.saveTaskRegistry(currentRun, registry);
+        return currentRun;
+      }
 
       await this.publishRuntimeEvent(currentRun, {
         type: "verification_observed",
@@ -328,27 +379,58 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       } satisfies RuntimeEventDraft);
 
       if (decision.status === "pass") {
-        stepStates[step.id] = markStepPassed(stepStates[step.id], []);
+        const artifactIds = execution.output.artifact_refs.map((artifact) => artifact.id);
+        stepStates[step.id] = markStepPassed(stepStates[step.id], artifactIds);
+        registry = updateTaskRegistryStep(registry, step.id, stepStates[step.id]);
+        await this.saveTaskRegistry(currentRun, registry);
       } else {
-        stepStates[step.id] = markStepFailed(
+        const failedState = markStepFailed(
           stepStates[step.id],
-          decision.reasons.join("; ")
+          [...decision.reasons, ...decision.errors].join("; ")
         );
+        if (failedState.attempt < step.max_retries) {
+          stepStates[step.id] = {
+            ...failedState,
+            status: "Pending"
+          };
+          registry = updateTaskRegistryStep(registry, step.id, stepStates[step.id]);
+          await this.saveTaskRegistry(currentRun, registry);
+          continue;
+        }
+
+        stepStates[step.id] = failedState;
+        registry = updateTaskRegistryStep(registry, step.id, stepStates[step.id]);
         currentRun = {
           ...currentRun,
-          run_status: "Failed"
+          run_status: decision.status === "inconclusive" ? "AwaitingUser" : "Failed",
+          pending_user_request:
+            decision.status === "inconclusive"
+              ? {
+                  id: `${currentRun.run_id}-${step.id}-verification`,
+                  kind: "clarification",
+                  question: `Verification for ${step.id} was inconclusive. Decide how to continue.`,
+                  context: decision.errors.join("; "),
+                  timeout_policy: "wait",
+                  correlation_id: `${currentRun.run_id}-${step.id}-verification`
+                }
+              : undefined
         };
         await this.publishRuntimeEvent(currentRun, {
           type: "run_failed",
-          reason: decision.reasons.join("; ")
+          reason: [...decision.reasons, ...decision.errors].join("; ")
         } satisfies RuntimeEventDraft);
         await this.saveRunState(currentRun);
+        await this.saveTaskRegistry(currentRun, registry);
         return currentRun;
       }
     }
   }
 
-  private async applyBudgetDebit(run: RunState, amountUsd: number): Promise<RunState> {
+  private async applyBudgetDebit(
+    run: RunState,
+    amountUsd: number,
+    reason = "processing the run"
+  ): Promise<RunState> {
     const debit = debitBudget(run.budget_snapshot, amountUsd, {
       entry_id: `${run.run_id}-${run.budget_snapshot.ledger.length + 1}`,
       session_id: run.session_id,
@@ -367,10 +449,44 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       )
     );
 
-    return {
+    let nextRun: RunState = {
       ...run,
       budget_snapshot: debit.snapshot
     };
+
+    if (debit.events.some((event) => event.type === "budget_hard_stopped")) {
+      nextRun = {
+        ...nextRun,
+        run_status: "Failed"
+      };
+      await this.publishRuntimeEvent(nextRun, {
+        type: "run_failed",
+        reason: "Budget hard stop reached"
+      } satisfies RuntimeEventDraft);
+    } else if (
+      debit.events.some((event) => event.type === "budget_threshold_reached") &&
+      !run.pending_user_request
+    ) {
+      const request: UserInteractionRequest = {
+        id: `${run.run_id}-budget-gate-${run.budget_snapshot.ledger.length + 1}`,
+        kind: "budget_gate",
+        question: `Budget threshold reached while ${reason}. Continue?`,
+        context: `spent_usd=${debit.snapshot.spent_usd.toFixed(2)}`,
+        timeout_policy: "wait",
+        correlation_id: `${run.run_id}-budget-gate`
+      };
+      nextRun = {
+        ...nextRun,
+        run_status: "AwaitingUser",
+        pending_user_request: request
+      };
+      await this.publishRuntimeEvent(nextRun, {
+        type: "approval_requested",
+        request
+      } satisfies RuntimeEventDraft);
+    }
+
+    return nextRun;
   }
 
   private async publishRuntimeEvent(
@@ -413,5 +529,24 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       run.run_id
     );
     await store.save(run);
+  }
+
+  private async saveTaskRegistry(
+    run: RunState,
+    registry: ReturnType<typeof createTaskRegistrySnapshot>
+  ): Promise<void> {
+    await writeJsonAtomic(
+      join(
+        this.options.rootDir,
+        ".harness",
+        "sessions",
+        run.session_id,
+        "runs",
+        run.run_id,
+        "projections",
+        "task-registry.json"
+      ),
+      registry
+    );
   }
 }

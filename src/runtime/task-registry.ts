@@ -46,3 +46,30 @@ export function createTaskRegistrySnapshot(
     task_claims: {}
   };
 }
+
+export function updateTaskRegistryStep(
+  snapshot: TaskRegistrySnapshot,
+  stepId: string,
+  state: StepRuntimeState
+): TaskRegistrySnapshot {
+  return {
+    ...snapshot,
+    steps: {
+      ...snapshot.steps,
+      [stepId]: state
+    }
+  };
+}
+
+export function recordTaskRegistryArtifacts(
+  snapshot: TaskRegistrySnapshot,
+  artifacts: ArtifactRef[]
+): TaskRegistrySnapshot {
+  return {
+    ...snapshot,
+    artifacts: {
+      ...snapshot.artifacts,
+      ...Object.fromEntries(artifacts.map((artifact) => [artifact.id, artifact]))
+    }
+  };
+}
