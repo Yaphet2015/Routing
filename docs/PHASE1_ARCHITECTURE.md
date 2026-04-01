@@ -24,3 +24,5 @@ Phase 1 delivers a leader-only runtime with protocol-ready persistence and broke
 - Single active run per session.
 - Leader-only orchestration; teammate runtime is not implemented.
 - Approval, artifact, and broker protocol shapes already exist so later phases can add teammate execution without replacing persistence.
+- The REPL host now exposes session-level commands for status, run attachment, pause/resume, and approval routing.
+- Session resume validates the active run event log protocol header before restoring interactive state.

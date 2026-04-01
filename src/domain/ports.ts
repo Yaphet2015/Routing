@@ -30,6 +30,18 @@ export interface ResumeResult {
   pending_user_interactions: UserInteractionRequest[];
 }
 
+export interface SessionOverview {
+  session_id: string;
+  session_status: SessionStateStoreRecord["session_status"];
+  active_run_id?: string;
+  run_ids: string[];
+  runs: Array<{
+    run_id: string;
+    run_status: RunState["run_status"];
+  }>;
+  pending_user_interactions: string[];
+}
+
 export interface UserTurnInput {
   session_id: string;
   text: string;
@@ -39,7 +51,10 @@ export interface UserTurnInput {
 
 export interface SessionKernelPort {
   submitUserInput(input: UserTurnInput): Promise<KernelTurnResult>;
-  attachRun(runId: string): Promise<void>;
+  attachRun(sessionId: string, runId: string): Promise<void>;
+  getSessionOverview(sessionId: string): Promise<SessionOverview>;
+  pauseRun(sessionId: string, runId?: string): Promise<RunState>;
+  resumeRun(sessionId: string, runId?: string): Promise<RunState>;
   interruptCurrentTurn(reason: string): Promise<void>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
   closeSession(): Promise<void>;
@@ -55,6 +70,12 @@ export interface BrokerPort {
 
 export interface StatusSink {
   onEvent(event: RuntimeEvent | BrokerMessage | { type: string }): Promise<void>;
+  flush(): Promise<void>;
+}
+
+export interface MetricsSink {
+  increment(name: string, value?: number): Promise<void>;
+  gauge(name: string, value: number): Promise<void>;
   flush(): Promise<void>;
 }
 

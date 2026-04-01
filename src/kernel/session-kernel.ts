@@ -9,12 +9,14 @@ import type { ApprovalRequest, SessionStateStoreRecord } from "../domain/protoco
 import type {
   KernelTurnResult,
   ResumeResult,
+  SessionOverview,
   SessionKernelPort,
   StatusSink,
   UserTurnInput
 } from "../domain/ports";
 import type { AgentRuntimePort, RuntimeEnginePort } from "../domain/ports";
 import type { RunState, UserInteractionResponse } from "../domain/types";
+import { pauseRun, resumeRun } from "../runtime/state-machine";
 import { DeterministicRuntimeEngine } from "../runtime/runtime-engine";
 
 interface SessionKernelOptions {
@@ -104,8 +106,100 @@ export class SessionKernel implements SessionKernelPort {
     return interaction;
   }
 
-  async attachRun(runId: string): Promise<void> {
-    return;
+  async attachRun(sessionId: string, runId: string): Promise<void> {
+    const sessionStore = new FileSystemSessionStateStore(this.options.rootDir, sessionId);
+    const session = await this.loadSessionState(sessionStore, sessionId);
+
+    if (!session.run_ids.includes(runId)) {
+      throw new Error(`Run not found in session: ${runId}`);
+    }
+
+    await sessionStore.save({
+      ...session,
+      active_run_id: runId
+    });
+  }
+
+  async getSessionOverview(sessionId: string): Promise<SessionOverview> {
+    const sessionStore = new FileSystemSessionStateStore(this.options.rootDir, sessionId);
+    const session = await this.loadSessionState(sessionStore, sessionId);
+    const runs = await Promise.all(
+      session.run_ids.map(async (runId) => {
+        const runStore = new FileSystemRunStateStore(this.options.rootDir, sessionId, runId);
+        const run = await this.tryLoadRun(runStore);
+        return {
+          run_id: runId,
+          run_status: run?.run_status ?? "Draft"
+        };
+      })
+    );
+
+    const pending = await Promise.all(
+      session.run_ids.map(async (runId) => {
+        const runStore = new FileSystemRunStateStore(this.options.rootDir, sessionId, runId);
+        const run = await this.tryLoadRun(runStore);
+        return run?.pending_user_request?.question;
+      })
+    );
+
+    return {
+      session_id: sessionId,
+      session_status: session.session_status,
+      active_run_id: session.active_run_id,
+      run_ids: session.run_ids,
+      runs,
+      pending_user_interactions: pending.filter(
+        (question): question is string => Boolean(question)
+      )
+    };
+  }
+
+  async pauseRun(sessionId: string, runId?: string): Promise<RunState> {
+    const sessionStore = new FileSystemSessionStateStore(this.options.rootDir, sessionId);
+    const session = await this.loadSessionState(sessionStore, sessionId);
+    const targetRunId = runId ?? session.active_run_id;
+    if (!targetRunId) {
+      throw new Error("No active run to pause");
+    }
+
+    const runStore = new FileSystemRunStateStore(this.options.rootDir, sessionId, targetRunId);
+    const run = await this.tryLoadRun(runStore);
+    if (!run) {
+      throw new Error(`Run not found: ${targetRunId}`);
+    }
+
+    const paused = pauseRun(run);
+    await runStore.save(paused);
+    await sessionStore.save({
+      ...session,
+      active_run_id: targetRunId,
+      session_status: paused.run_status === "Paused" ? "Resumable" : session.session_status
+    });
+    return paused;
+  }
+
+  async resumeRun(sessionId: string, runId?: string): Promise<RunState> {
+    const sessionStore = new FileSystemSessionStateStore(this.options.rootDir, sessionId);
+    const session = await this.loadSessionState(sessionStore, sessionId);
+    const targetRunId = runId ?? session.active_run_id;
+    if (!targetRunId) {
+      throw new Error("No active run to resume");
+    }
+
+    const runStore = new FileSystemRunStateStore(this.options.rootDir, sessionId, targetRunId);
+    const run = await this.tryLoadRun(runStore);
+    if (!run) {
+      throw new Error(`Run not found: ${targetRunId}`);
+    }
+
+    const resumed = resumeRun(run);
+    await runStore.save(resumed);
+    await sessionStore.save({
+      ...session,
+      active_run_id: targetRunId,
+      session_status: resumed.pending_user_request ? "AwaitingUser" : "Active"
+    });
+    return resumed;
   }
 
   async interruptCurrentTurn(reason: string): Promise<void> {
@@ -118,6 +212,15 @@ export class SessionKernel implements SessionKernelPort {
     const pending: ResumeResult["pending_user_interactions"] = [];
 
     if (session.active_run_id) {
+      const broker = new FileSystemBroker(
+        this.options.rootDir,
+        sessionId,
+        session.active_run_id
+      );
+      for await (const _event of broker.replay()) {
+        break;
+      }
+
       const runStore = new FileSystemRunStateStore(
         this.options.rootDir,
         sessionId,

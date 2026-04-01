@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { FileSystemBroker } from "../../src/adapters/fs/file-system-broker";
 import { FileSystemRunStateStore, FileSystemSessionStateStore } from "../../src/adapters/fs/state-store";
+import { PROTOCOL_VERSION } from "../../src/domain/protocol";
 import { SessionKernel } from "../../src/kernel/session-kernel";
 import type { ApprovalRequest } from "../../src/domain/protocol";
 import type {
@@ -13,7 +14,8 @@ import type {
   AgentRuntimePort,
   StatusSink
 } from "../../src/domain/ports";
-import type { TaskGraph, VerifyObservation } from "../../src/domain/types";
+import type { BudgetPolicy, RunState, TaskGraph, VerifyObservation } from "../../src/domain/types";
+import { createRunState } from "../../src/runtime/state-machine";
 
 class NullStatusSink implements StatusSink {
   public readonly events: string[] = [];
@@ -70,6 +72,15 @@ class ApprovalOnlyAgentRuntime implements AgentRuntimePort {
     };
   }
 }
+
+const budgetPolicy: BudgetPolicy = {
+  task_budget_usd: 10,
+  step_budget_cap_usd: 5,
+  replan_budget_cap_usd: 2,
+  teammate_budget_cap_usd: 2,
+  approval_threshold_usd: 8,
+  hard_stop_threshold_usd: 10
+};
 
 describe("SessionKernel", () => {
   const roots: string[] = [];
@@ -151,5 +162,131 @@ describe("SessionKernel", () => {
     }
 
     expect(replayedTypes).toContain("approval_response");
+  });
+
+  it("attaches a historical run and updates the active run pointer", async () => {
+    const root = await mkdtemp(join(tmpdir(), "routing-kernel-"));
+    roots.push(root);
+
+    const sessionStore = new FileSystemSessionStateStore(root, "session-1");
+    const run1Store = new FileSystemRunStateStore(root, "session-1", "run-1");
+    const run2Store = new FileSystemRunStateStore(root, "session-1", "run-2");
+
+    await sessionStore.save({
+      session_id: "session-1",
+      session_status: "Active",
+      active_run_id: "run-1",
+      run_ids: ["run-1", "run-2"],
+      compact_boundary_seq: 0
+    });
+    await run1Store.save(createRunState("session-1", "run-1", budgetPolicy));
+    await run2Store.save(createRunState("session-1", "run-2", budgetPolicy));
+
+    const kernel = new SessionKernel({
+      rootDir: root,
+      workspaceDir: root,
+      statusSink: new NullStatusSink(),
+      agentRuntime: new ApprovalOnlyAgentRuntime(),
+      requirePlanApproval: true
+    });
+
+    await kernel.attachRun("session-1", "run-2");
+
+    await expect(sessionStore.load()).resolves.toMatchObject({
+      active_run_id: "run-2"
+    });
+  });
+
+  it("pauses and resumes the active run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "routing-kernel-"));
+    roots.push(root);
+
+    const sessionStore = new FileSystemSessionStateStore(root, "session-1");
+    const runStore = new FileSystemRunStateStore(root, "session-1", "run-1");
+    const running: RunState = {
+      ...createRunState("session-1", "run-1", budgetPolicy),
+      run_status: "Executing",
+      current_step_id: "step-1",
+      current_step_attempt: 1
+    };
+
+    await sessionStore.save({
+      session_id: "session-1",
+      session_status: "Active",
+      active_run_id: "run-1",
+      run_ids: ["run-1"],
+      compact_boundary_seq: 0
+    });
+    await runStore.save(running);
+
+    const kernel = new SessionKernel({
+      rootDir: root,
+      workspaceDir: root,
+      statusSink: new NullStatusSink(),
+      agentRuntime: new ApprovalOnlyAgentRuntime(),
+      requirePlanApproval: true
+    });
+
+    const paused = await kernel.pauseRun("session-1");
+    expect(paused.run_status).toBe("Paused");
+
+    const resumed = await kernel.resumeRun("session-1");
+    expect(resumed.run_status).toBe("Executing");
+  });
+
+  it("rejects session resume when the active run protocol version is incompatible", async () => {
+    const root = await mkdtemp(join(tmpdir(), "routing-kernel-"));
+    roots.push(root);
+
+    const sessionStore = new FileSystemSessionStateStore(root, "session-1");
+    await sessionStore.save({
+      session_id: "session-1",
+      session_status: "Resumable",
+      active_run_id: "run-1",
+      run_ids: ["run-1"],
+      compact_boundary_seq: 0
+    });
+
+    const broker = new FileSystemBroker(root, "session-1", "run-1");
+    await broker.publish({
+      type: "status_update",
+      message_id: "message-1",
+      seq: 0,
+      session_id: "session-1",
+      run_id: "run-1",
+      from_agent_id: "leader",
+      to_agent_id: "leader",
+      created_at: "2026-04-02T00:00:00.000Z",
+      status: "Running"
+    });
+
+    const eventsPath = join(
+      root,
+      ".harness",
+      "sessions",
+      "session-1",
+      "runs",
+      "run-1",
+      "events",
+      "events.ndjson"
+    );
+    const raw = await readFile(eventsPath, "utf8");
+    await writeFile(
+      eventsPath,
+      raw.replace(PROTOCOL_VERSION, "routing/test-incompatible"),
+      "utf8"
+    );
+
+    const kernel = new SessionKernel({
+      rootDir: root,
+      workspaceDir: root,
+      statusSink: new NullStatusSink(),
+      agentRuntime: new ApprovalOnlyAgentRuntime(),
+      requirePlanApproval: true
+    });
+
+    await expect(kernel.resumeSession("session-1")).rejects.toThrow(
+      "Unsupported protocol version"
+    );
   });
 });

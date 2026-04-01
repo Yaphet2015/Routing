@@ -6,6 +6,8 @@ import { cwd } from "node:process";
 import { randomUUID } from "node:crypto";
 
 import { ClaudeAgentRuntimeAdapter } from "./adapters/claude/claude-agent-runtime";
+import type { SessionKernelPort } from "./domain/ports";
+import { executeShellCommand } from "./kernel/host-shell";
 import { SessionKernel } from "./kernel/session-kernel";
 import { ConsoleStatusSink } from "./kernel/console-status-sink";
 
@@ -23,7 +25,7 @@ function parseArgs(argv: string[]): { sessionId: string; resume: boolean } {
 async function main(): Promise<void> {
   const { sessionId, resume } = parseArgs(process.argv);
   const workspaceDir = cwd();
-  const kernel = new SessionKernel({
+  const kernel: SessionKernelPort = new SessionKernel({
     rootDir: workspaceDir,
     workspaceDir,
     statusSink: new ConsoleStatusSink(),
@@ -36,7 +38,11 @@ async function main(): Promise<void> {
 
   const rl = createInterface({ input, output });
   process.stdout.write(
-    `Routing Phase 1 REPL\nsession: ${sessionId}\ncommands: /exit, /help\n`
+    [
+      "Routing REPL",
+      `session: ${sessionId}`,
+      "commands: /help, /status, /runs, /attach <run-id>, /pause, /resume, /approve <answer>, /exit"
+    ].join("\n") + "\n"
   );
 
   if (resume) {
@@ -57,8 +63,11 @@ async function main(): Promise<void> {
     if (line === "/exit") {
       break;
     }
-    if (line === "/help") {
-      process.stdout.write("Type a task to start or continue the active run.\n");
+
+    if (line.startsWith("/")) {
+      process.stdout.write(
+        `${await executeShellCommand(kernel, sessionId, line)}\n`
+      );
       continue;
     }
 
