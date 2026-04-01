@@ -28,6 +28,7 @@ The file system is only the transport. The canonical truth is the append-only ev
 - A session may keep multiple historical runs, but only one run is active at a time.
 - Future teammates default to `worktree` isolation unless a stricter placement requires something else.
 - `projections/task-registry.json` tracks step state, artifacts, and later delegated-task ownership as a rebuildable view over the event log.
+- `task_claim`, `task_result`, `artifact_published`, and worker `approval_request` messages are sufficient to rebuild delegated-task ownership and the last known teammate handoff state.
 
 ## Phase 1 Limits
 

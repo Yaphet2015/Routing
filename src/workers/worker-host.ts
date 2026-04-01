@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { BrokerMessage } from "../domain/protocol";
+import type { ApprovalRequest, BrokerMessage } from "../domain/protocol";
 import type { AgentRuntimePort, BrokerPort } from "../domain/ports";
 import { z } from "zod";
 
@@ -36,7 +36,20 @@ const executionSchema = z.object({
         .optional(),
       summary: z.string()
     })
-  )
+  ),
+  approval_request: z
+    .object({
+      id: z.string(),
+      kind: z.enum(["plan", "plan_revision", "budget", "task_result", "permission"]),
+      question: z.string(),
+      context: z.string().optional(),
+      requester_agent_id: z.string(),
+      target: z.enum(["leader", "user"]),
+      related_run_id: z.string(),
+      correlation_id: z.string(),
+      deadline: z.string().optional()
+    })
+    .optional()
 });
 
 interface WorkerHostOptions {
@@ -103,6 +116,34 @@ export class WorkerHost {
         created_at: new Date().toISOString(),
         artifact
       });
+    }
+
+    if (execution.output.approval_request) {
+      await this.options.broker.publish({
+        type: "approval_request",
+        message_id: `${assignment.task.id}-approval-${randomUUID()}`,
+        seq: 0,
+        session_id: assignment.session_id,
+        run_id: assignment.run_id,
+        from_agent_id: this.options.agentId,
+        to_agent_id: "leader",
+        created_at: new Date().toISOString(),
+        request: execution.output.approval_request as ApprovalRequest
+      });
+      await this.options.broker.publish({
+        type: "status_update",
+        message_id: `${assignment.task.id}-awaiting-approval-${randomUUID()}`,
+        seq: 0,
+        session_id: assignment.session_id,
+        run_id: assignment.run_id,
+        from_agent_id: this.options.agentId,
+        to_agent_id: "leader",
+        created_at: new Date().toISOString(),
+        status: "AwaitingApproval",
+        detail: assignment.task.title
+      });
+      await this.options.broker.ack(this.options.agentId, assignment.seq);
+      return true;
     }
 
     await this.options.broker.publish({

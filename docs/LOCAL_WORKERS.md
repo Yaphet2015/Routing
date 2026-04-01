@@ -16,5 +16,5 @@ Phase 2 introduces a local-process teammate foundation without enabling delegate
 ## Current limits
 
 - The leader runtime now materializes delegated steps into worker tasks, runs them inside isolated worktrees, captures a patch artifact, and applies that patch back into the leader workspace.
-- Approval escalation from teammate to leader/user is not wired yet.
-- Ownership rebuild, orphan worker recovery, and teammate-driven approval escalation are still pending.
+- Worker approval requests now flow through broker `approval_request` messages and pause the leader run as user-facing approval prompts.
+- Ownership rebuild is projection-based, but orphan worker recovery and late-response reconciliation are still pending.

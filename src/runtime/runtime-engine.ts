@@ -36,8 +36,10 @@ import {
   selectNextExecutableStep
 } from "./state-machine";
 import {
+  applyBrokerMessageToTaskRegistry,
   createTaskRegistrySnapshot,
   recordTaskRegistryArtifacts,
+  registerCollaborationTask,
   updateTaskRegistryStep
 } from "./task-registry";
 import { judgeVerification } from "./verification";
@@ -174,6 +176,8 @@ interface RuntimeEngineOptions {
   requirePlanApproval: boolean;
   workerRuntime?: WorkerRuntimePort;
   worktreeManager?: WorktreeManagerPort;
+  workerEnv?: NodeJS.ProcessEnv;
+  workerEntryPath?: string;
 }
 
 export class DeterministicRuntimeEngine implements RuntimeEnginePort {
@@ -338,9 +342,10 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         artifact_refs: ArtifactRef[];
       };
       if (step.execution_mode === "delegated") {
-        const delegated = await this.executeDelegatedStep(currentRun, step);
+        const delegated = await this.executeDelegatedStep(currentRun, step, registry);
         currentRun = delegated.run;
         execution = delegated.execution;
+        registry = delegated.registry;
       } else {
         const inlineExecution = await this.options.agentRuntime.invoke<{
           summary: string;
@@ -452,9 +457,11 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
 
   private async executeDelegatedStep(
     run: RunState,
-    step: PlanStep
+    step: PlanStep,
+    registry: ReturnType<typeof createTaskRegistrySnapshot>
   ): Promise<{
     run: RunState;
+    registry: ReturnType<typeof createTaskRegistrySnapshot>;
     execution: {
       summary: string;
       artifact_refs: ArtifactRef[];
@@ -504,6 +511,7 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       budget_snapshot: reserved.snapshot
     };
 
+    let nextRegistry = registerCollaborationTask(registry, task);
     await this.publishRuntimeEvent(nextRun, {
       type: "collab_task_created",
       task_id: taskId
@@ -521,6 +529,7 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       task
     };
     await this.options.broker.publish(assignmentMessage);
+    nextRegistry = applyBrokerMessageToTaskRegistry(nextRegistry, assignmentMessage);
     await this.options.broker.deliver(assignmentMessage.message_id);
     await this.options.broker.publish({
       type: "status_update",
@@ -534,11 +543,13 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       status: "Running",
       detail: step.title
     });
+    await this.saveTaskRegistry(nextRun, nextRegistry);
 
     const result = await workerRuntime.run({
       command: process.execPath,
       args: [
-        join(this.options.rootDir, "src", "worker-entry.ts"),
+        this.options.workerEntryPath ??
+          join(this.options.rootDir, "src", "worker-entry.ts"),
         this.options.rootDir,
         worktree.path,
         run.session_id,
@@ -546,7 +557,7 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         agentId
       ],
       cwd: this.options.rootDir,
-      env: process.env
+      env: this.options.workerEnv ?? process.env
     });
 
     if (result.exitCode !== 0) {
@@ -561,8 +572,36 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       } satisfies RuntimeEventDraft);
       return {
         run: nextRun,
+        registry: nextRegistry,
         execution: {
           summary: `Delegated worker failed for ${step.id}`,
+          artifact_refs: []
+        }
+      };
+    }
+
+    const workerMessages = await this.collectWorkerMessages(agentId);
+    for (const message of workerMessages) {
+      nextRegistry = applyBrokerMessageToTaskRegistry(nextRegistry, message);
+    }
+    const approvalRequest = workerMessages.find(
+      (
+        message
+      ): message is Extract<typeof workerMessages[number], { type: "approval_request" }> =>
+        message.type === "approval_request"
+    );
+    if (approvalRequest) {
+      await worktreeManager.remove(worktree.path).catch(() => undefined);
+      nextRun = {
+        ...nextRun,
+        run_status: "AwaitingUser",
+        pending_user_request: this.createApprovalInteraction(run.run_id, approvalRequest.request)
+      };
+      return {
+        run: nextRun,
+        registry: nextRegistry,
+        execution: {
+          summary: approvalRequest.request.question,
           artifact_refs: []
         }
       };
@@ -608,9 +647,20 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         created_at: new Date().toISOString(),
         artifact: patchArtifact
       });
+      nextRegistry = applyBrokerMessageToTaskRegistry(nextRegistry, {
+        type: "artifact_published",
+        message_id: `${patchArtifact.id}-synthetic`,
+        seq: 0,
+        session_id: run.session_id,
+        run_id: run.run_id,
+        from_agent_id: agentId,
+        to_agent_id: "leader",
+        created_at: new Date().toISOString(),
+        artifact: patchArtifact
+      });
     }
 
-    await this.options.broker.publish({
+    const resultMessage = {
       type: "task_result",
       message_id: `${taskId}-result`,
       seq: 0,
@@ -622,8 +672,10 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       task_id: taskId,
       artifact_refs: artifactRefs,
       summary: `Delegated task ${taskId} completed`
-    });
-    await this.options.broker.publish({
+    } as const;
+    await this.options.broker.publish(resultMessage);
+    nextRegistry = applyBrokerMessageToTaskRegistry(nextRegistry, resultMessage);
+    const completedMessage = {
       type: "status_update",
       message_id: `${taskId}-completed`,
       seq: 0,
@@ -634,11 +686,14 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       created_at: new Date().toISOString(),
       status: "Completed",
       detail: step.title
-    });
+    } as const;
+    await this.options.broker.publish(completedMessage);
+    nextRegistry = applyBrokerMessageToTaskRegistry(nextRegistry, completedMessage);
 
     await worktreeManager.remove(worktree.path).catch(() => undefined);
     return {
       run: nextRun,
+      registry: nextRegistry,
       execution: {
         summary: `Delegated task ${taskId} completed`,
         artifact_refs: artifactRefs
@@ -776,5 +831,17 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       maxBuffer: 10 * 1024 * 1024
     });
     return stdout;
+  }
+
+  private async collectWorkerMessages(agentId: string) {
+    const messages: Array<
+      Extract<Awaited<ReturnType<BrokerPort["pollInbox"]>>[number], { from_agent_id: string }>
+    > = [];
+    for await (const event of this.options.broker.replay()) {
+      if ("from_agent_id" in event && event.from_agent_id === agentId) {
+        messages.push(event as typeof messages[number]);
+      }
+    }
+    return messages;
   }
 }

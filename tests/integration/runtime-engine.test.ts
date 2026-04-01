@@ -381,6 +381,71 @@ class DelegatedWorkerAgentRuntime implements AgentRuntimePort {
   }
 }
 
+class WorkerApprovalAgentRuntime implements AgentRuntimePort {
+  async invoke<TOutput>(
+    invocation: AgentRuntimeInvocation<TOutput>
+  ): Promise<AgentRuntimeInvocationResult<TOutput>> {
+    if (invocation.role === "planner") {
+      return {
+        sessionId: "planner-session",
+        totalCostUsd: 0.11,
+        output: {
+          goal: "Need teammate approval",
+          assumptions: [],
+          steps: [
+            {
+              id: "step-1",
+              title: "Delegate gated feature",
+              type: "implement",
+              action: "Delegate the gated code change",
+              dependencies: [],
+              preferred_profile: "executor",
+              execution_mode: "delegated",
+              verification_spec_id: "verify-1",
+              done_when: {},
+              max_retries: 1,
+              timeout_ms: 60_000
+            }
+          ],
+          verification_specs: [
+            {
+              id: "verify-1",
+              related_step_ids: ["step-1"],
+              description: "unused",
+              invariants: [],
+              test_scenarios: [],
+              verification_approach: "unused",
+              acceptance_criteria: []
+            }
+          ],
+          budget_policy: {
+            task_budget_usd: 10,
+            step_budget_cap_usd: 5,
+            replan_budget_cap_usd: 2,
+            teammate_budget_cap_usd: 2,
+            approval_threshold_usd: 8,
+            hard_stop_threshold_usd: 10
+          }
+        } as TOutput,
+        messages: []
+      };
+    }
+
+    return {
+      sessionId: "noop-session",
+      totalCostUsd: 0.01,
+      output: {
+        verification_spec_id: "verify-1",
+        commands_run: [],
+        scenario_results: [],
+        generated_artifacts: [],
+        summary: "noop"
+      } as TOutput,
+      messages: []
+    };
+  }
+}
+
 class FakeDelegatedWorkerRuntime implements WorkerRuntimePort {
   async run(input: LocalProcessRunInput): Promise<LocalProcessRunResult> {
     await writeFile(join(input.cwd, "feature.txt"), "delegated change\n", "utf8");
@@ -549,5 +614,51 @@ describe("DeterministicRuntimeEngine", () => {
 
     expect(eventLog).toContain("\"type\":\"task_assignment\"");
     expect(eventLog).toContain("\"type\":\"task_result\"");
+  });
+
+  it("forwards teammate approval requests into user-facing runtime state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "routing-runtime-worker-approval-"));
+    roots.push(root);
+
+    await execFileAsync("git", ["init"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "routing@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Routing Tests"], { cwd: root });
+    await writeFile(join(root, "feature.txt"), "base line\n", "utf8");
+    await execFileAsync("git", ["add", "feature.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-m", "init"], { cwd: root });
+
+    const broker = new FileSystemBroker(root, "session-1", "run-1");
+    const engine = new DeterministicRuntimeEngine({
+      rootDir: root,
+      workspaceDir: root,
+      broker,
+      agentRuntime: new WorkerApprovalAgentRuntime(),
+      requirePlanApproval: false,
+      worktreeManager: new GitWorktreeManager(root),
+      workerEntryPath: join(process.cwd(), "src", "worker-entry.ts"),
+      workerEnv: {
+        ...process.env,
+        ROUTING_WORKER_APPROVAL_JSON: JSON.stringify({
+          id: "worker-approval-1",
+          kind: "task_result",
+          question: "Apply delegated patch to leader workspace?",
+          requester_agent_id: "worker-step-1",
+          target: "leader",
+          related_run_id: "run-1",
+          correlation_id: "corr-worker-1"
+        })
+      }
+    });
+
+    const run = await engine.startRun({
+      sessionId: "session-1",
+      runId: "run-1",
+      goal: "delegate a gated change"
+    });
+
+    expect(run.run_status).toBe("AwaitingUser");
+    expect(run.pending_user_request?.kind).toBe("approval");
+    expect(run.pending_user_request?.source_approval_request_id).toBe("worker-approval-1");
+    expect(run.pending_user_request?.correlation_id).toBe("corr-worker-1");
   });
 });
