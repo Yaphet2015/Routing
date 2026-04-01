@@ -11,6 +11,7 @@
 - Added local worker foundations: git worktree isolation, local process launching, broker-driven worker host execution, and a standalone worker entrypoint.
 - Wired delegated runtime steps through isolated worktrees with patch artifact capture and leader-side patch apply back into the main workspace.
 - Added teammate approval forwarding plus task-ownership/result projection rebuild from broker claim/result/artifact messages.
+- Added REPL operations documentation and a gated live Claude Agent SDK smoke test for end-to-end verification outside normal CI.
 
 ## 0.1.0
 
