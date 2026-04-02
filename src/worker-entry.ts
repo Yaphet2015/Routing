@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
-import { ClaudeAgentRuntimeAdapter } from "./adapters/claude/claude-agent-runtime";
 import { FileSystemBroker } from "./adapters/fs/file-system-broker";
+import { createAgentRuntime } from "./adapters/runtime-factory";
 import type {
   AgentRuntimeInvocation,
   AgentRuntimeInvocationResult,
@@ -51,7 +51,7 @@ async function main(): Promise<void> {
     agentRuntime:
       process.env.ROUTING_WORKER_APPROVAL_JSON || process.env.ROUTING_WORKER_RESULT_JSON
         ? new FixtureWorkerAgentRuntime()
-        : new ClaudeAgentRuntimeAdapter({
+        : createAgentRuntime({
             cwd: workspaceDir,
             model: process.env.ROUTING_MODEL ?? "claude-sonnet-4-6"
           })

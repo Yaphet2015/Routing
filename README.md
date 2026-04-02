@@ -32,7 +32,10 @@ Optional:
 
 ```bash
 export ROUTING_MODEL=claude-sonnet-4-6
+export ROUTING_AGENT_RUNTIME=mock
 ```
+
+Set `ROUTING_AGENT_RUNTIME=mock` to run the REPL smoke path without Claude credentials. In that mode the planner, executor, and verifier are deterministic fixtures that exercise the full approval and completion flow.
 
 ## Start The REPL
 
@@ -97,6 +100,18 @@ bun test --config vitest.live.config.ts tests/live/claude-sdk.smoke.test.ts
 ```
 
 If `ANTHROPIC_API_KEY` is not set, the live smoke test is skipped.
+
+Run the deterministic CLI smoke test:
+
+```bash
+bun test tests/integration/cli.test.ts
+```
+
+Run the REPL manually in mock mode:
+
+```bash
+ROUTING_AGENT_RUNTIME=mock bun src/cli.ts
+```
 
 ## How It Works
 

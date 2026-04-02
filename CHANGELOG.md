@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a deterministic mock agent runtime plus CLI coverage so the REPL approval, execution, verification, and resume flow can be smoke-tested without Claude credentials.
 - Hardened the protocol model with `protocol_header` version checks, `Paused` run state, timeout/deadline fields, and expanded step/artifact types.
 - Made verification verdicts capable of reporting `inconclusive` outcomes and explicit verification errors.
 - Removed array-order dependence from step scheduling and documented single-active-run plus default worktree isolation expectations.

@@ -5,7 +5,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { cwd } from "node:process";
 import { randomUUID } from "node:crypto";
 
-import { ClaudeAgentRuntimeAdapter } from "./adapters/claude/claude-agent-runtime";
+import { createAgentRuntime } from "./adapters/runtime-factory";
 import type { SessionKernelPort } from "./domain/ports";
 import { executeShellCommand } from "./kernel/host-shell";
 import { SessionKernel } from "./kernel/session-kernel";
@@ -29,7 +29,7 @@ async function main(): Promise<void> {
     rootDir: workspaceDir,
     workspaceDir,
     statusSink: new ConsoleStatusSink(),
-    agentRuntime: new ClaudeAgentRuntimeAdapter({
+    agentRuntime: createAgentRuntime({
       cwd: workspaceDir,
       model: process.env.ROUTING_MODEL ?? "claude-sonnet-4-6"
     }),
