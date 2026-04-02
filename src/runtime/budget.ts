@@ -30,10 +30,16 @@ export function debitBudget(
   };
 
   const events: BudgetEvent[] = [{ type: "budget_debited", amount_usd: amountUsd }];
-  if (spentUsd >= snapshot.policy.approval_threshold_usd) {
+  if (
+    snapshot.spent_usd < snapshot.policy.approval_threshold_usd &&
+    spentUsd >= snapshot.policy.approval_threshold_usd
+  ) {
     events.push({ type: "budget_threshold_reached", spent_usd: spentUsd });
   }
-  if (spentUsd >= snapshot.policy.hard_stop_threshold_usd) {
+  if (
+    snapshot.spent_usd < snapshot.policy.hard_stop_threshold_usd &&
+    spentUsd >= snapshot.policy.hard_stop_threshold_usd
+  ) {
     events.push({ type: "budget_hard_stopped", spent_usd: spentUsd });
   }
 

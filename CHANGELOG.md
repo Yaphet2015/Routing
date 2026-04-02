@@ -8,6 +8,9 @@
 - Added a testable REPL host shell with `/status`, `/runs`, `/attach`, `/pause`, `/resume`, and `/approve` commands backed by session-kernel lifecycle methods.
 - Made session resume reject incompatible event-log protocol versions before restoring the active run.
 - Added runtime retries, budget-gate user stops, and persisted task-registry projection updates for step/artifact state.
+- Made initial plan approvals and budget-gate approvals resume the paused run instead of prematurely terminating it.
+- Gated delegated patch application behind explicit user approval before anything is applied back to the leader workspace.
+- Tightened budget-threshold semantics to fire on threshold crossings only, and added focused coverage for `ContextManager` prompt trimming.
 - Added local worker foundations: git worktree isolation, local process launching, broker-driven worker host execution, and a standalone worker entrypoint.
 - Wired delegated runtime steps through isolated worktrees with patch artifact capture and leader-side patch apply back into the main workspace.
 - Added teammate approval forwarding plus task-ownership/result projection rebuild from broker claim/result/artifact messages.

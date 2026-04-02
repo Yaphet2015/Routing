@@ -301,6 +301,22 @@ export interface StepRuntimeState {
   produced_artifacts: string[];
 }
 
+export interface PendingPatchApply {
+  step_id: string;
+  step_title: string;
+  task_id: string;
+  summary: string;
+  artifact_refs: ArtifactRef[];
+  patch_path: string;
+}
+
+export interface PendingStepExecution {
+  step_id: string;
+  step_title: string;
+  summary: string;
+  artifact_refs: ArtifactRef[];
+}
+
 export interface BudgetSnapshot {
   policy: BudgetPolicy;
   spent_usd: number;
@@ -321,4 +337,8 @@ export interface RunState {
   baseline_ref?: BaselineRef["id"];
   active_task_ids: string[];
   last_event_seq: number;
+  task_graph?: TaskGraph;
+  step_states?: Record<string, StepRuntimeState>;
+  pending_patch_apply?: PendingPatchApply;
+  pending_step_execution?: PendingStepExecution;
 }

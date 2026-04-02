@@ -1,12 +1,12 @@
 import { execFile } from "node:child_process";
 import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 import { z } from "zod";
 
 import { FileSystemRunStateStore } from "../adapters/fs/state-store";
-import { writeJsonAtomic } from "../adapters/fs/file-utils";
+import { ensureDir, readJsonFile, writeJsonAtomic } from "../adapters/fs/file-utils";
 import type { ApprovalRequest, RuntimeEvent } from "../domain/protocol";
 import type {
   AgentRuntimePort,
@@ -19,8 +19,11 @@ import type {
 import type {
   ArtifactRef,
   CollaborationTask,
+  PendingPatchApply,
+  PendingStepExecution,
   PlanStep,
   RunState,
+  StepRuntimeState,
   TaskGraph,
   UserInteractionRequest,
   UserInteractionResponse,
@@ -40,6 +43,7 @@ import {
   createTaskRegistrySnapshot,
   recordTaskRegistryArtifacts,
   registerCollaborationTask,
+  type TaskRegistrySnapshot,
   updateTaskRegistryStep
 } from "./task-registry";
 import { judgeVerification } from "./verification";
@@ -195,6 +199,10 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       input.runId,
       planned.output.budget_policy
     );
+    run = {
+      ...run,
+      task_graph: planned.output
+    };
     run = await this.applyBudgetDebit(run, planned.totalCostUsd);
 
     await this.publishRuntimeEvent(run, {
@@ -235,6 +243,8 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       return run;
     }
 
+    const approved = /^y|approve|yes$/i.test(response.answer);
+
     if (run.pending_user_request.kind === "approval") {
       await this.options.broker.publish({
         type: "approval_response",
@@ -247,23 +257,68 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         created_at: response.answered_at,
         response: {
           request_id: run.pending_user_request.source_approval_request_id ?? response.request_id,
-          approved: /^y|approve|yes$/i.test(response.answer),
+          approved,
           answer: response.answer,
           approver_agent_id: "user",
           answered_at: response.answered_at,
           correlation_id: response.correlation_id
         }
       });
-      const nextRun: RunState = {
-        ...run,
-        pending_user_request: undefined,
-        run_status: /^y|approve|yes$/i.test(response.answer) ? "Completed" : "Cancelled"
-      };
-      await this.saveRunState(nextRun);
-      return nextRun;
     }
 
-    return run;
+    if (!approved) {
+      const cancelled: RunState = {
+        ...run,
+        pending_user_request: undefined,
+        pending_patch_apply: undefined,
+        pending_step_execution: undefined,
+        run_status: "Cancelled"
+      };
+      await this.saveRunState(cancelled);
+      return cancelled;
+    }
+
+    if (run.pending_patch_apply) {
+      return this.applyApprovedPatch({
+        ...run,
+        pending_user_request: undefined,
+        run_status: "Ready"
+      });
+    }
+
+    if (run.run_status === "AwaitingApproval" || run.pending_user_request.kind === "budget_gate") {
+      if (!run.task_graph) {
+        throw new Error(`Missing task graph for resumable run: ${runId}`);
+      }
+
+      if (run.pending_step_execution) {
+        return this.continueFromExecutedStep(
+          {
+            ...run,
+            pending_user_request: undefined,
+            run_status: "Ready"
+          },
+          run.pending_step_execution
+        );
+      }
+
+      return this.executePlannedRun(
+        {
+          ...run,
+          pending_user_request: undefined,
+          run_status: "Ready"
+        },
+        run.task_graph
+      );
+    }
+
+    const completed: RunState = {
+      ...run,
+      pending_user_request: undefined,
+      run_status: "Completed"
+    };
+    await this.saveRunState(completed);
+    return completed;
   }
 
   async registerApprovalRequest(
@@ -284,13 +339,21 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
   }
 
   private async executePlannedRun(run: RunState, graph: TaskGraph): Promise<RunState> {
-    const stepStates: Record<string, ReturnType<typeof createEmptyStepState>> =
-      Object.fromEntries(
-        graph.steps.map((step: PlanStep) => [step.id, createEmptyStepState(step.id)])
-      );
-    let registry = createTaskRegistrySnapshot(run.run_id, run.plan_version, graph);
+    const stepStates = this.cloneStepStates(
+      run.step_states ??
+        Object.fromEntries(
+          graph.steps.map((step: PlanStep) => [step.id, createEmptyStepState(step.id)])
+        )
+    );
+    let registry = await this.loadTaskRegistry(run, graph);
     await this.saveTaskRegistry(run, registry);
-    let currentRun = run;
+    let currentRun: RunState = {
+      ...run,
+      task_graph: graph,
+      step_states: this.cloneStepStates(stepStates),
+      pending_patch_apply: undefined,
+      pending_step_execution: undefined
+    };
 
     while (true) {
       const step = selectNextExecutableStep(graph.steps, stepStates);
@@ -313,7 +376,9 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
           ...currentRun,
           run_status: "Completed",
           current_step_id: undefined,
-          current_step_attempt: undefined
+          current_step_attempt: undefined,
+          step_states: this.cloneStepStates(stepStates),
+          pending_patch_apply: undefined
         };
         await this.publishRuntimeEvent(currentRun, {
           type: "run_completed",
@@ -325,11 +390,23 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       }
 
       currentRun = beginRunExecution(currentRun, step.id);
+      currentRun = {
+        ...currentRun,
+        task_graph: graph,
+        step_states: this.cloneStepStates(stepStates)
+      };
       registry = updateTaskRegistryStep(registry, step.id, {
         ...stepStates[step.id],
-        status: "Executing",
-        attempt: currentRun.current_step_attempt ?? 1
+        status: "Executing"
       });
+      stepStates[step.id] = {
+        ...stepStates[step.id],
+        status: "Executing"
+      };
+      currentRun = {
+        ...currentRun,
+        step_states: this.cloneStepStates(stepStates)
+      };
       await this.saveTaskRegistry(currentRun, registry);
       await this.publishRuntimeEvent(currentRun, {
         type: "step_started",
@@ -367,6 +444,19 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       registry = recordTaskRegistryArtifacts(registry, execution.artifact_refs);
       await this.saveTaskRegistry(currentRun, registry);
       if (currentRun.run_status === "AwaitingUser" || currentRun.run_status === "Failed") {
+        if (currentRun.pending_user_request?.kind === "budget_gate") {
+          currentRun = {
+            ...currentRun,
+            step_states: this.cloneStepStates(stepStates),
+            pending_step_execution: {
+              step_id: step.id,
+              step_title: step.title,
+              summary: execution.summary,
+              artifact_refs: execution.artifact_refs
+            }
+          };
+        }
+        await this.saveTaskRegistry(currentRun, registry);
         await this.saveRunState(currentRun);
         return currentRun;
       }
@@ -389,6 +479,18 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         `verifying ${step.id}`
       );
       if (currentRun.run_status === "AwaitingUser" || currentRun.run_status === "Failed") {
+        if (currentRun.pending_user_request?.kind === "budget_gate") {
+          currentRun = {
+            ...currentRun,
+            step_states: this.cloneStepStates(stepStates),
+            pending_step_execution: {
+              step_id: step.id,
+              step_title: step.title,
+              summary: execution.summary,
+              artifact_refs: execution.artifact_refs
+            }
+          };
+        }
         await this.saveRunState(currentRun);
         await this.saveTaskRegistry(currentRun, registry);
         return currentRun;
@@ -411,6 +513,11 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         const artifactIds = execution.artifact_refs.map((artifact) => artifact.id);
         stepStates[step.id] = markStepPassed(stepStates[step.id], artifactIds);
         registry = updateTaskRegistryStep(registry, step.id, stepStates[step.id]);
+        currentRun = {
+          ...currentRun,
+          step_states: this.cloneStepStates(stepStates),
+          pending_step_execution: undefined
+        };
         await this.saveTaskRegistry(currentRun, registry);
       } else {
         const failedState = markStepFailed(
@@ -423,6 +530,11 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
             status: "Pending"
           };
           registry = updateTaskRegistryStep(registry, step.id, stepStates[step.id]);
+          currentRun = {
+            ...currentRun,
+            step_states: this.cloneStepStates(stepStates),
+            pending_step_execution: undefined
+          };
           await this.saveTaskRegistry(currentRun, registry);
           continue;
         }
@@ -432,6 +544,8 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         currentRun = {
           ...currentRun,
           run_status: decision.status === "inconclusive" ? "AwaitingUser" : "Failed",
+          step_states: this.cloneStepStates(stepStates),
+          pending_step_execution: undefined,
           pending_user_request:
             decision.status === "inconclusive"
               ? {
@@ -546,7 +660,7 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
     await this.saveTaskRegistry(nextRun, nextRegistry);
 
     const result = await workerRuntime.run({
-      command: process.execPath,
+      command: this.resolveWorkerCommand(),
       args: [
         this.options.workerEntryPath ??
           join(this.options.rootDir, "src", "worker-entry.ts"),
@@ -620,10 +734,8 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         "artifacts",
         `${taskId}.patch`
       );
+      await ensureDir(dirname(patchPath));
       await writeFile(patchPath, patch, "utf8");
-      await execFileAsync("git", ["apply", patchPath], {
-        cwd: this.options.workspaceDir
-      });
       const patchArtifact: ArtifactRef = {
         id: `${taskId}-patch`,
         kind: "patch",
@@ -658,6 +770,43 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
         created_at: new Date().toISOString(),
         artifact: patchArtifact
       });
+
+      await worktreeManager.remove(worktree.path).catch(() => undefined);
+      nextRun = {
+        ...nextRun,
+        run_status: "AwaitingUser",
+        pending_user_request: this.createApprovalInteraction(run.run_id, {
+          id: `${taskId}-merge-approval`,
+          kind: "task_result",
+          question: `Apply delegated patch for ${step.title} to the leader workspace?`,
+          requester_agent_id: agentId,
+          target: "user",
+          related_run_id: run.run_id,
+          correlation_id: `${taskId}-merge-approval`
+        }),
+        pending_patch_apply: {
+          step_id: step.id,
+          step_title: step.title,
+          task_id: taskId,
+          summary: `Delegated task ${taskId} completed`,
+          artifact_refs: artifactRefs,
+          patch_path: patchPath
+        },
+        pending_step_execution: {
+          step_id: step.id,
+          step_title: step.title,
+          summary: `Delegated task ${taskId} completed`,
+          artifact_refs: artifactRefs
+        }
+      };
+      return {
+        run: nextRun,
+        registry: nextRegistry,
+        execution: {
+          summary: `Awaiting approval to apply delegated patch for ${step.id}`,
+          artifact_refs: artifactRefs
+        }
+      };
     }
 
     const resultMessage = {
@@ -843,5 +992,234 @@ export class DeterministicRuntimeEngine implements RuntimeEnginePort {
       }
     }
     return messages;
+  }
+
+  private async applyApprovedPatch(run: RunState): Promise<RunState> {
+    const pending = run.pending_patch_apply;
+    const graph = run.task_graph;
+    const stepStates = this.cloneStepStates(run.step_states ?? {});
+    if (!pending || !graph) {
+      throw new Error(`Missing delegated patch state for run ${run.run_id}`);
+    }
+
+    const step = graph.steps.find((candidate) => candidate.id === pending.step_id);
+    if (!step) {
+      throw new Error(`Step not found for delegated patch approval: ${pending.step_id}`);
+    }
+
+    let registry = await this.loadTaskRegistry(run, graph);
+
+    await execFileAsync("git", ["apply", pending.patch_path], {
+      cwd: this.options.workspaceDir
+    });
+
+    const resultMessage = {
+      type: "task_result",
+      message_id: `${pending.task_id}-result`,
+      seq: 0,
+      session_id: run.session_id,
+      run_id: run.run_id,
+      from_agent_id: `worker-${pending.step_id}`,
+      to_agent_id: "leader",
+      created_at: new Date().toISOString(),
+      task_id: pending.task_id,
+      artifact_refs: pending.artifact_refs,
+      summary: pending.summary
+    } as const;
+    await this.options.broker.publish(resultMessage);
+    registry = applyBrokerMessageToTaskRegistry(registry, resultMessage);
+
+    const completedMessage = {
+      type: "status_update",
+      message_id: `${pending.task_id}-completed`,
+      seq: 0,
+      session_id: run.session_id,
+      run_id: run.run_id,
+      from_agent_id: `worker-${pending.step_id}`,
+      to_agent_id: "leader",
+      created_at: new Date().toISOString(),
+      status: "Completed",
+      detail: pending.step_title
+    } as const;
+    await this.options.broker.publish(completedMessage);
+    registry = applyBrokerMessageToTaskRegistry(registry, completedMessage);
+
+    let currentRun: RunState = {
+      ...run,
+      pending_patch_apply: undefined,
+      pending_step_execution: undefined,
+      task_graph: graph,
+      step_states: this.cloneStepStates(stepStates)
+    };
+    return this.continueFromExecutedStep(currentRun, {
+      step_id: pending.step_id,
+      step_title: pending.step_title,
+      summary: pending.summary,
+      artifact_refs: pending.artifact_refs
+    }, registry);
+  }
+
+  private async continueFromExecutedStep(
+    run: RunState,
+    pending: PendingStepExecution,
+    existingRegistry?: TaskRegistrySnapshot
+  ): Promise<RunState> {
+    const graph = run.task_graph;
+    const stepStates = this.cloneStepStates(run.step_states ?? {});
+    if (!graph) {
+      throw new Error(`Missing task graph for executed-step continuation: ${run.run_id}`);
+    }
+
+    const step = graph.steps.find((candidate) => candidate.id === pending.step_id);
+    if (!step) {
+      throw new Error(`Step not found for executed-step continuation: ${pending.step_id}`);
+    }
+
+    let registry = existingRegistry ?? (await this.loadTaskRegistry(run, graph));
+    let currentRun: RunState = {
+      ...run,
+      task_graph: graph,
+      step_states: this.cloneStepStates(stepStates),
+      pending_step_execution: pending
+    };
+
+    await this.publishRuntimeEvent(currentRun, {
+      type: "step_execution_finished",
+      step_id: step.id,
+      summary: pending.summary
+    } satisfies RuntimeEventDraft);
+
+    const verification = await this.options.agentRuntime.invoke<VerifyObservation>({
+      role: "verifier",
+      prompt: `Verify step ${step.id}: ${step.title}`,
+      schema: verificationSchema,
+      sessionId: currentRun.run_id
+    });
+    currentRun = await this.applyBudgetDebit(
+      currentRun,
+      verification.totalCostUsd,
+      `verifying ${step.id}`
+    );
+    if (currentRun.run_status === "AwaitingUser" || currentRun.run_status === "Failed") {
+      currentRun = {
+        ...currentRun,
+        step_states: this.cloneStepStates(stepStates),
+        pending_step_execution: pending
+      };
+      await this.saveTaskRegistry(currentRun, registry);
+      await this.saveRunState(currentRun);
+      return currentRun;
+    }
+
+    await this.publishRuntimeEvent(currentRun, {
+      type: "verification_observed",
+      step_id: step.id,
+      summary: verification.output.summary
+    } satisfies RuntimeEventDraft);
+
+    const decision = judgeVerification(verification.output);
+    await this.publishRuntimeEvent(currentRun, {
+      type: "verification_judged",
+      step_id: step.id,
+      status: decision.status
+    } satisfies RuntimeEventDraft);
+
+    if (decision.status === "pass") {
+      stepStates[step.id] = markStepPassed(
+        stepStates[step.id],
+        pending.artifact_refs.map((artifact) => artifact.id)
+      );
+      registry = updateTaskRegistryStep(registry, step.id, stepStates[step.id]);
+      currentRun = {
+        ...currentRun,
+        step_states: this.cloneStepStates(stepStates),
+        pending_step_execution: undefined
+      };
+      await this.saveTaskRegistry(currentRun, registry);
+      return this.executePlannedRun(currentRun, graph);
+    }
+
+    const failedState = markStepFailed(
+      stepStates[step.id],
+      [...decision.reasons, ...decision.errors].join("; ")
+    );
+    if (failedState.attempt < step.max_retries) {
+      stepStates[step.id] = {
+        ...failedState,
+        status: "Pending"
+      };
+      registry = updateTaskRegistryStep(registry, step.id, stepStates[step.id]);
+      currentRun = {
+        ...currentRun,
+        step_states: this.cloneStepStates(stepStates),
+        pending_step_execution: undefined
+      };
+      await this.saveTaskRegistry(currentRun, registry);
+      return this.executePlannedRun(currentRun, graph);
+    }
+
+    stepStates[step.id] = failedState;
+    registry = updateTaskRegistryStep(registry, step.id, stepStates[step.id]);
+    currentRun = {
+      ...currentRun,
+      run_status: decision.status === "inconclusive" ? "AwaitingUser" : "Failed",
+      step_states: this.cloneStepStates(stepStates),
+      pending_step_execution: undefined,
+      pending_user_request:
+        decision.status === "inconclusive"
+          ? {
+              id: `${currentRun.run_id}-${step.id}-verification`,
+              kind: "clarification",
+              question: `Verification for ${step.id} was inconclusive. Decide how to continue.`,
+              context: decision.errors.join("; "),
+              timeout_policy: "wait",
+              correlation_id: `${currentRun.run_id}-${step.id}-verification`
+            }
+          : undefined
+    };
+    await this.publishRuntimeEvent(currentRun, {
+      type: "run_failed",
+      reason: [...decision.reasons, ...decision.errors].join("; ")
+    } satisfies RuntimeEventDraft);
+    await this.saveRunState(currentRun);
+    await this.saveTaskRegistry(currentRun, registry);
+    return currentRun;
+  }
+
+  private async loadTaskRegistry(run: RunState, graph: TaskGraph): Promise<TaskRegistrySnapshot> {
+    const registryPath = join(
+      this.options.rootDir,
+      ".harness",
+      "sessions",
+      run.session_id,
+      "runs",
+      run.run_id,
+      "projections",
+      "task-registry.json"
+    );
+
+    try {
+      return await readJsonFile<TaskRegistrySnapshot>(registryPath);
+    } catch {
+      return createTaskRegistrySnapshot(run.run_id, run.plan_version, graph);
+    }
+  }
+
+  private cloneStepStates(
+    stepStates: Record<string, StepRuntimeState>
+  ): Record<string, StepRuntimeState> {
+    return Object.fromEntries(
+      Object.entries(stepStates).map(([stepId, state]) => [
+        stepId,
+        {
+          ...state,
+          produced_artifacts: [...state.produced_artifacts]
+        }
+      ])
+    );
+  }
+
+  private resolveWorkerCommand(): string {
+    return process.versions.bun ? process.execPath : "bun";
   }
 }

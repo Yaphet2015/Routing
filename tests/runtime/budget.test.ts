@@ -53,6 +53,28 @@ describe("budget engine", () => {
     ]);
   });
 
+  it("emits the approval threshold event only on the first crossing", () => {
+    const snapshot = createBudgetSnapshot(policy);
+    const firstDebit = debitBudget(snapshot, 8.5, {
+      entry_id: "entry-1",
+      session_id: "session-1",
+      run_id: "run-1",
+      kind: "model_call",
+      amount_usd: 8.5,
+      created_at: "2026-04-02T00:00:00.000Z"
+    });
+    const secondDebit = debitBudget(firstDebit.snapshot, 0.5, {
+      entry_id: "entry-2",
+      session_id: "session-1",
+      run_id: "run-1",
+      kind: "model_call",
+      amount_usd: 0.5,
+      created_at: "2026-04-02T00:00:01.000Z"
+    });
+
+    expect(secondDebit.events).toEqual([{ type: "budget_debited", amount_usd: 0.5 }]);
+  });
+
   it("reserves teammate budget without counting it as spend", () => {
     const snapshot = createBudgetSnapshot(policy);
     const result = reserveBudget(snapshot, 2.5, {

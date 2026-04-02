@@ -448,7 +448,12 @@ class WorkerApprovalAgentRuntime implements AgentRuntimePort {
 
 class FakeDelegatedWorkerRuntime implements WorkerRuntimePort {
   async run(input: LocalProcessRunInput): Promise<LocalProcessRunResult> {
-    await writeFile(join(input.cwd, "feature.txt"), "delegated change\n", "utf8");
+    const worktreePath = input.args?.[2];
+    if (!worktreePath) {
+      throw new Error("missing worktree path");
+    }
+
+    await writeFile(join(worktreePath, "feature.txt"), "delegated change\n", "utf8");
     return {
       exitCode: 0,
       signal: null
@@ -563,7 +568,105 @@ describe("DeterministicRuntimeEngine", () => {
     expect(run.pending_user_request?.kind).toBe("budget_gate");
   });
 
-  it("materializes delegated work, applies the resulting patch, and completes the run", async () => {
+  it("continues executing after the user approves the initial plan", async () => {
+    const root = await mkdtemp(join(tmpdir(), "routing-runtime-plan-approval-"));
+    roots.push(root);
+    const broker = new FileSystemBroker(root, "session-1", "run-1");
+    const engine = new DeterministicRuntimeEngine({
+      rootDir: root,
+      workspaceDir: root,
+      broker,
+      agentRuntime: new FakeAgentRuntime(),
+      requirePlanApproval: true
+    });
+
+    const awaitingApproval = await engine.startRun({
+      sessionId: "session-1",
+      runId: "run-1",
+      goal: "wait for plan approval"
+    });
+
+    expect(awaitingApproval.run_status).toBe("AwaitingApproval");
+    expect(awaitingApproval.pending_user_request?.kind).toBe("approval");
+
+    const resumed = await engine.continueRunWithUserResponse("session-1", "run-1", {
+      request_id: awaitingApproval.pending_user_request!.id,
+      answer: "yes",
+      answered_at: "2026-04-02T00:00:00.000Z",
+      correlation_id: awaitingApproval.pending_user_request!.correlation_id
+    });
+
+    expect(resumed.run_status).toBe("Completed");
+
+    const eventLog = await readFile(
+      join(
+        root,
+        ".harness",
+        "sessions",
+        "session-1",
+        "runs",
+        "run-1",
+        "events",
+        "events.ndjson"
+      ),
+      "utf8"
+    );
+
+    expect(eventLog).toContain("\"type\":\"approval_response\"");
+    expect(eventLog).toContain("\"type\":\"step_started\"");
+    expect(eventLog).toContain("\"type\":\"run_completed\"");
+  });
+
+  it("continues the paused run after the user approves a budget gate", async () => {
+    const root = await mkdtemp(join(tmpdir(), "routing-runtime-budget-approval-"));
+    roots.push(root);
+    const broker = new FileSystemBroker(root, "session-1", "run-1");
+    const engine = new DeterministicRuntimeEngine({
+      rootDir: root,
+      workspaceDir: root,
+      broker,
+      agentRuntime: new BudgetGateAgentRuntime(),
+      requirePlanApproval: false
+    });
+
+    const awaitingBudgetApproval = await engine.startRun({
+      sessionId: "session-1",
+      runId: "run-1",
+      goal: "trip the budget gate"
+    });
+
+    expect(awaitingBudgetApproval.run_status).toBe("AwaitingUser");
+    expect(awaitingBudgetApproval.pending_user_request?.kind).toBe("budget_gate");
+
+    const resumed = await engine.continueRunWithUserResponse("session-1", "run-1", {
+      request_id: awaitingBudgetApproval.pending_user_request!.id,
+      answer: "yes",
+      answered_at: "2026-04-02T00:00:00.000Z",
+      correlation_id: awaitingBudgetApproval.pending_user_request!.correlation_id
+    });
+
+    expect(resumed.run_status).toBe("Completed");
+
+    const eventLog = await readFile(
+      join(
+        root,
+        ".harness",
+        "sessions",
+        "session-1",
+        "runs",
+        "run-1",
+        "events",
+        "events.ndjson"
+      ),
+      "utf8"
+    );
+
+    expect(eventLog).toContain("\"type\":\"step_execution_finished\"");
+    expect(eventLog).toContain("\"type\":\"verification_judged\"");
+    expect(eventLog).toContain("\"type\":\"run_completed\"");
+  });
+
+  it("requires approval before applying a delegated patch back to the leader workspace", async () => {
     const root = await mkdtemp(join(tmpdir(), "routing-runtime-delegated-"));
     roots.push(root);
 
@@ -591,8 +694,20 @@ describe("DeterministicRuntimeEngine", () => {
       goal: "delegate the file change"
     });
 
-    expect(run.run_status).toBe("Completed");
+    expect(run.run_status).toBe("AwaitingUser");
+    expect(run.pending_user_request?.kind).toBe("approval");
     expect(run.budget_snapshot.reserved_usd).toBeGreaterThan(0);
+
+    await expect(readFile(join(root, "feature.txt"), "utf8")).resolves.toBe("base line\n");
+
+    const resumed = await engine.continueRunWithUserResponse("session-1", "run-1", {
+      request_id: run.pending_user_request!.id,
+      answer: "yes",
+      answered_at: "2026-04-02T00:00:00.000Z",
+      correlation_id: run.pending_user_request!.correlation_id
+    });
+
+    expect(resumed.run_status).toBe("Completed");
 
     await expect(readFile(join(root, "feature.txt"), "utf8")).resolves.toContain(
       "delegated change"
